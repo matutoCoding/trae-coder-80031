@@ -46,12 +46,16 @@ const TicketGenerate: React.FC = () => {
 
   const selectedExam = exams.find((e) => e.id === selectedExamId);
   const examAssignments = assignments.filter(
-    (a) => a.examId === selectedExamId && a.status === "completed"
+    (a) => a.examId === selectedExamId && a.status === "confirmed"
   );
   const generatedTickets = tickets.filter(
     (t) => t.examId === selectedExamId
   );
-  const pendingCount = examAssignments.length - generatedTickets.length;
+  const existingAssignmentIds = new Set(generatedTickets.map((t) => t.assignmentId));
+  const pendingAssignments = examAssignments.filter(
+    (a) => !existingAssignmentIds.has(a.id)
+  );
+  const pendingCount = pendingAssignments.length;
 
   const handleBatchGenerate = async () => {
     setIsGenerating(true);

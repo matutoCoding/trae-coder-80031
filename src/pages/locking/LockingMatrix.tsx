@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useMemo } from "react";
 import { useExamStore } from "@/store/useExamStore";
 import {
   Lock,
@@ -8,6 +8,9 @@ import {
   Users,
   AlertTriangle,
   ShieldCheck,
+  Calendar,
+  CheckCircle2,
+  Repeat,
 } from "lucide-react";
 import SeatGrid from "@/components/SeatGrid";
 import Modal from "@/components/Modal";
@@ -19,13 +22,19 @@ const LockingMatrix: React.FC = () => {
     seats,
     assignments,
     students,
+    exams,
     lockSeat,
     unlockSeat,
+    getSeatStatusForExam,
+    getOverlappingExamIds,
     initData,
   } = useExamStore();
 
   const [selectedRoomId, setSelectedRoomId] = useState<string>(
     examRooms[0]?.id || ""
+  );
+  const [selectedExamId, setSelectedExamId] = useState<string>(
+    exams[0]?.id || ""
   );
   const [viewingSeat, setViewingSeat] = useState<Seat | null>(null);
   const [lockReason, setLockReason] = useState("");
@@ -40,17 +49,66 @@ const LockingMatrix: React.FC = () => {
     }
   }, [examRooms, selectedRoomId]);
 
+  useEffect(() => {
+    if (exams.length > 0 && !selectedExamId) {
+      setSelectedExamId(exams[0].id);
+    }
+  }, [exams, selectedExamId]);
+
   const currentRoom = examRooms.find((r) => r.id === selectedRoomId);
   const currentSeats = seats.filter((s) => s.roomId === selectedRoomId);
+  const selectedExam = exams.find((e) => e.id === selectedExamId);
 
-  const stats = {
-    total: currentSeats.length,
-    locked: currentSeats.filter((s) => s.isLocked).length,
-    occupied: currentSeats.filter((s) => s.status === "occupied").length,
-    available: currentSeats.filter(
-      (s) => s.status === "available" && !s.isLocked
-    ).length,
-  };
+  const occupiedOtherSeatIds = useMemo(() => {
+    if (!selectedExamId) return new Set<string>();
+    const set = new Set<string>();
+    currentSeats.forEach((seat) => {
+      const st = getSeatStatusForExam(seat.id, selectedExamId);
+      if (st.status === "occupied-other") set.add(seat.id);
+    });
+    return set;
+  }, [currentSeats, selectedExamId, getSeatStatusForExam]);
+
+  const stats = useMemo(() => {
+    let available = 0;
+    let occupiedCurrent = 0;
+    let occupiedOther = 0;
+    let locked = 0;
+    let disabled = 0;
+    currentSeats.forEach((seat) => {
+      if (!selectedExamId) {
+        if (seat.status === "disabled") disabled++;
+        else if (seat.isLocked) locked++;
+        else if (seat.status === "occupied") occupiedCurrent++;
+        else available++;
+        return;
+      }
+      const st = getSeatStatusForExam(seat.id, selectedExamId);
+      switch (st.status) {
+        case "available":
+          available++;
+          break;
+        case "occupied-current":
+          occupiedCurrent++;
+          break;
+        case "occupied-other":
+          occupiedOther++;
+          break;
+        case "locked":
+          locked++;
+          break;
+        case "disabled":
+          disabled++;
+          break;
+      }
+    });
+    return { total: currentSeats.length, available, occupiedCurrent, occupiedOther, locked, disabled };
+  }, [currentSeats, selectedExamId, getSeatStatusForExam]);
+
+  const overlappingExamsCount = useMemo(() => {
+    if (!selectedExamId) return 0;
+    return getOverlappingExamIds(selectedExamId).size - 1;
+  }, [selectedExamId, getOverlappingExamIds]);
 
   const handleLockSeat = () => {
     if (viewingSeat && lockReason) {
@@ -63,7 +121,7 @@ const LockingMatrix: React.FC = () => {
   const handleBatchUnlock = () => {
     if (confirm("确定解锁该考场所有手动锁定的考位吗？")) {
       currentSeats
-        .filter((s) => s.isLocked && s.lockReason !== "已分配考位")
+        .filter((s) => s.isLocked && s.lockedBy === "admin")
         .forEach((s) => unlockSeat(s.id));
     }
   };
@@ -76,13 +134,39 @@ const LockingMatrix: React.FC = () => {
     return students.find((s) => s.id === assignment.studentId);
   };
 
+  const getSeatExamStatus = (seatId: string) => {
+    if (!selectedExamId) return null;
+    return getSeatStatusForExam(seatId, selectedExamId);
+  };
+
+  const getSeatStatusLabel = (seat: Seat) => {
+    const st = selectedExamId ? getSeatStatusForExam(seat.id, selectedExamId) : null;
+    if (st) {
+      switch (st.status) {
+        case "available":
+          return "空闲可用";
+        case "occupied-current":
+          return "当前考试已分配";
+        case "occupied-other": {
+          const examName = exams.find((e) => e.id === st.assignment?.examId)?.name;
+          return examName ? `被「${examName}」占用` : "被其他场次占用";
+        }
+        case "locked":
+          return "手动锁定";
+        case "disabled":
+          return "全局禁用";
+      }
+    }
+    return seat.isLocked ? "已锁定" : seat.status === "occupied" ? "已占用" : seat.status === "disabled" ? "不可用" : "空闲可用";
+  };
+
   return (
     <div className="space-y-6 animate-fade-in">
       <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4">
         <div>
           <h1 className="text-2xl font-bold text-slate-800">锁定矩阵</h1>
           <p className="text-slate-500 text-sm mt-1">
-            查看考位锁定状态，支持手动锁定/解锁考位
+            按考试时间维度查看考位状态，支持手动锁定/解锁考位
           </p>
         </div>
         <button
@@ -94,55 +178,82 @@ const LockingMatrix: React.FC = () => {
         </button>
       </div>
 
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-        <div className="bg-white rounded-2xl p-5 shadow-sm border border-slate-100">
+      {selectedExam && (
+        <div className="bg-gradient-to-r from-accent-50 to-primary-50 rounded-2xl p-4 border border-primary-200/50 flex flex-wrap items-center gap-4 text-sm">
+          <div className="flex items-center gap-2 text-primary-700 font-medium">
+            <Calendar size={16} />
+            当前视角: {selectedExam.name}
+          </div>
+          <div className="text-slate-500">
+            {new Date(selectedExam.startTime).toLocaleString("zh-CN")} - {new Date(selectedExam.endTime).toLocaleTimeString("zh-CN", {hour: "2-digit", minute: "2-digit"})}
+          </div>
+          <div className="px-3 py-1 bg-white rounded-lg text-slate-600 flex items-center gap-1.5">
+            <Repeat size={14} />
+            时间冲突场次数: <span className="font-semibold text-warning-600">{overlappingExamsCount}</span>
+          </div>
+        </div>
+      )}
+
+      <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
+        <div className="bg-white rounded-2xl p-4 shadow-sm border border-slate-100">
           <div className="flex items-center gap-3">
-            <div className="w-11 h-11 rounded-xl bg-gradient-to-br from-slate-500 to-slate-700 flex items-center justify-center">
-              <Armchair size={22} className="text-white" />
+            <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-slate-500 to-slate-700 flex items-center justify-center">
+              <Armchair size={20} className="text-white" />
             </div>
             <div>
-              <p className="text-sm text-slate-500">总考位</p>
-              <p className="text-2xl font-bold text-slate-800">{stats.total}</p>
+              <p className="text-xs text-slate-500">总考位</p>
+              <p className="text-xl font-bold text-slate-800">{stats.total}</p>
             </div>
           </div>
         </div>
-        <div className="bg-white rounded-2xl p-5 shadow-sm border border-slate-100">
+        <div className="bg-white rounded-2xl p-4 shadow-sm border border-slate-100">
           <div className="flex items-center gap-3">
-            <div className="w-11 h-11 rounded-xl bg-gradient-to-br from-warning-500 to-warning-700 flex items-center justify-center">
-              <Lock size={22} className="text-white" />
+            <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-emerald-500 to-emerald-700 flex items-center justify-center">
+              <CheckCircle2 size={20} className="text-white" />
             </div>
             <div>
-              <p className="text-sm text-slate-500">已锁定</p>
-              <p className="text-2xl font-bold text-warning-600">{stats.locked}</p>
+              <p className="text-xs text-slate-500">空闲可用</p>
+              <p className="text-xl font-bold text-emerald-600">{stats.available}</p>
             </div>
           </div>
         </div>
-        <div className="bg-white rounded-2xl p-5 shadow-sm border border-slate-100">
+        <div className="bg-white rounded-2xl p-4 shadow-sm border border-slate-100">
           <div className="flex items-center gap-3">
-            <div className="w-11 h-11 rounded-xl bg-gradient-to-br from-primary-500 to-primary-700 flex items-center justify-center">
-              <Users size={22} className="text-white" />
+            <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-primary-500 to-primary-700 flex items-center justify-center">
+              <Users size={20} className="text-white" />
             </div>
             <div>
-              <p className="text-sm text-slate-500">已占用</p>
-              <p className="text-2xl font-bold text-primary-600">{stats.occupied}</p>
+              <p className="text-xs text-slate-500">已分配(本场)</p>
+              <p className="text-xl font-bold text-primary-600">{stats.occupiedCurrent}</p>
             </div>
           </div>
         </div>
-        <div className="bg-white rounded-2xl p-5 shadow-sm border border-slate-100">
+        <div className="bg-white rounded-2xl p-4 shadow-sm border border-slate-100">
           <div className="flex items-center gap-3">
-            <div className="w-11 h-11 rounded-xl bg-gradient-to-br from-emerald-500 to-emerald-700 flex items-center justify-center">
-              <ShieldCheck size={22} className="text-white" />
+            <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-slate-400 to-slate-600 flex items-center justify-center">
+              <Repeat size={20} className="text-white" />
             </div>
             <div>
-              <p className="text-sm text-slate-500">可用</p>
-              <p className="text-2xl font-bold text-emerald-600">{stats.available}</p>
+              <p className="text-xs text-slate-500">可复用(他场)</p>
+              <p className="text-xl font-bold text-slate-600">{stats.occupiedOther}</p>
+            </div>
+          </div>
+        </div>
+        <div className="bg-white rounded-2xl p-4 shadow-sm border border-slate-100">
+          <div className="flex items-center gap-3">
+            <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-warning-500 to-warning-700 flex items-center justify-center">
+              <Lock size={20} className="text-white" />
+            </div>
+            <div>
+              <p className="text-xs text-slate-500">锁定/禁用</p>
+              <p className="text-xl font-bold text-warning-600">{stats.locked + stats.disabled}</p>
             </div>
           </div>
         </div>
       </div>
 
       <div className="bg-white rounded-2xl shadow-sm border border-slate-100 overflow-hidden">
-        <div className="p-5 border-b border-slate-100">
+        <div className="p-5 border-b border-slate-100 space-y-4">
           <div className="flex flex-col md:flex-row md:items-center gap-4">
             <div className="flex items-center gap-3">
               <Building2 size={18} className="text-slate-400" />
@@ -159,23 +270,43 @@ const LockingMatrix: React.FC = () => {
               </select>
             </div>
 
-            <div className="flex-1 flex flex-wrap items-center gap-4 text-xs">
-              <div className="flex items-center gap-1.5">
-                <div className="w-4 h-4 rounded bg-emerald-50 border-2 border-emerald-200"></div>
-                <span className="text-slate-600">空闲可用</span>
-              </div>
-              <div className="flex items-center gap-1.5">
-                <div className="w-4 h-4 rounded bg-primary-100 border-2 border-primary-300"></div>
-                <span className="text-slate-600">已分配</span>
-              </div>
-              <div className="flex items-center gap-1.5">
-                <div className="w-4 h-4 rounded bg-warning-50 border-2 border-warning-300"></div>
-                <span className="text-slate-600">已锁定</span>
-              </div>
-              <div className="flex items-center gap-1.5">
-                <div className="w-4 h-4 rounded bg-slate-100 border-2 border-slate-200"></div>
-                <span className="text-slate-600">不可用</span>
-              </div>
+            <div className="flex items-center gap-3">
+              <Calendar size={18} className="text-slate-400" />
+              <select
+                value={selectedExamId}
+                onChange={(e) => setSelectedExamId(e.target.value)}
+                className="px-4 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-primary-500/20 focus:border-primary-500"
+              >
+                <option value="">全局视图(不按考试)</option>
+                {exams.map((e) => (
+                  <option key={e.id} value={e.id}>
+                    {e.name}
+                  </option>
+                ))}
+              </select>
+            </div>
+          </div>
+
+          <div className="flex-1 flex flex-wrap items-center gap-4 text-xs">
+            <div className="flex items-center gap-1.5">
+              <div className="w-4 h-4 rounded bg-emerald-50 border-2 border-emerald-200"></div>
+              <span className="text-slate-600">空闲可用</span>
+            </div>
+            <div className="flex items-center gap-1.5">
+              <div className="w-4 h-4 rounded bg-primary-100 border-2 border-primary-300"></div>
+              <span className="text-slate-600">已分配(本场)</span>
+            </div>
+            <div className="flex items-center gap-1.5">
+              <div className="w-4 h-4 rounded bg-slate-100 border-2 border-slate-300"></div>
+              <span className="text-slate-600">可复用(他场占用)</span>
+            </div>
+            <div className="flex items-center gap-1.5">
+              <div className="w-4 h-4 rounded bg-warning-50 border-2 border-warning-300"></div>
+              <span className="text-slate-600">手动锁定</span>
+            </div>
+            <div className="flex items-center gap-1.5">
+              <div className="w-4 h-4 rounded bg-slate-200 border-2 border-slate-400 opacity-60"></div>
+              <span className="text-slate-600">全局禁用</span>
             </div>
           </div>
         </div>
@@ -187,6 +318,8 @@ const LockingMatrix: React.FC = () => {
             cols={currentRoom.cols}
             assignments={assignments}
             students={students}
+            examId={selectedExamId || undefined}
+            occupiedOtherSeatIds={occupiedOtherSeatIds}
             onSeatClick={(seat) => setViewingSeat(seat)}
           />
         )}
@@ -198,10 +331,10 @@ const LockingMatrix: React.FC = () => {
           <div>
             <h3 className="font-semibold text-warning-800">互斥锁定说明</h3>
             <ul className="mt-2 space-y-1 text-sm text-warning-700">
-              <li>• 考位分配成功后系统自动锁定，防止重复分配</li>
-              <li>• 可手动锁定特殊考位（如备用考位、故障考位等）</li>
-              <li>• 手动锁定需填写锁定原因，便于后续追溯</li>
-              <li>• 分配取消时自动释放锁定，考位恢复可用</li>
+              <li>• 考位按<b>考试时间</b>维度锁定，同一时间或时间重叠的考试才互斥占用</li>
+              <li>• 上午场分配过的座位，下午场只要时间不重叠就可以继续分配（「可复用」状态）</li>
+              <li>• 可手动锁定特殊考位（如备用考位、故障考位等），手动锁定全局生效</li>
+              <li>• 分配取消时自动释放锁定，仅释放对应考试时间占用</li>
               <li>• 批量解锁仅释放手动锁定的考位，不影响已分配考位</li>
             </ul>
           </div>
@@ -221,16 +354,18 @@ const LockingMatrix: React.FC = () => {
             <div className="flex items-center gap-4 p-4 bg-slate-50 rounded-xl">
               <div
                 className={`w-14 h-14 rounded-xl flex items-center justify-center ${
-                  viewingSeat.isLocked
+                  (selectedExamId ? getSeatStatusForExam(viewingSeat.id, selectedExamId).status === "locked" : viewingSeat.isLocked)
                     ? "bg-gradient-to-br from-warning-500 to-warning-700"
-                    : viewingSeat.status === "occupied"
+                    : (selectedExamId ? getSeatStatusForExam(viewingSeat.id, selectedExamId).status === "occupied-current" : viewingSeat.status === "occupied")
                     ? "bg-gradient-to-br from-primary-500 to-primary-700"
+                    : (selectedExamId ? getSeatStatusForExam(viewingSeat.id, selectedExamId).status === "occupied-other" : false)
+                    ? "bg-gradient-to-br from-slate-400 to-slate-600"
                     : "bg-gradient-to-br from-emerald-500 to-emerald-700"
                 }`}
               >
-                {viewingSeat.isLocked ? (
+                {(selectedExamId ? getSeatStatusForExam(viewingSeat.id, selectedExamId).status === "locked" : viewingSeat.isLocked) ? (
                   <Lock size={28} className="text-white" />
-                ) : viewingSeat.status === "occupied" ? (
+                ) : (selectedExamId ? getSeatStatusForExam(viewingSeat.id, selectedExamId).status === "occupied-current" || getSeatStatusForExam(viewingSeat.id, selectedExamId).status === "occupied-other" : viewingSeat.status === "occupied") ? (
                   <Users size={28} className="text-white" />
                 ) : (
                   <Armchair size={28} className="text-white" />
@@ -249,15 +384,11 @@ const LockingMatrix: React.FC = () => {
 
             <div className="grid grid-cols-2 gap-3 text-sm">
               <div className="p-3 bg-slate-50 rounded-lg">
-                <p className="text-xs text-slate-500">状态</p>
+                <p className="text-xs text-slate-500">
+                  {selectedExamId ? `在「${selectedExam?.name}」中状态` : "全局状态"}
+                </p>
                 <p className="font-semibold mt-0.5">
-                  {viewingSeat.isLocked
-                    ? "已锁定"
-                    : viewingSeat.status === "occupied"
-                    ? "已占用"
-                    : viewingSeat.status === "disabled"
-                    ? "不可用"
-                    : "空闲可用"}
+                  {getSeatStatusLabel(viewingSeat)}
                 </p>
               </div>
               <div className="p-3 bg-slate-50 rounded-lg">
@@ -287,6 +418,33 @@ const LockingMatrix: React.FC = () => {
               </div>
             )}
 
+            {selectedExamId && getSeatExamStatus(viewingSeat.id)?.status === "occupied-other" && (() => {
+              const st = getSeatExamStatus(viewingSeat.id)!;
+              const otherExam = exams.find((e) => e.id === st.assignment?.examId);
+              const student = students.find((s) => s.id === st.assignment?.studentId);
+              return (
+                <div className="p-4 bg-slate-50 rounded-xl border border-slate-200">
+                  <p className="text-xs text-slate-500 mb-1 flex items-center gap-1">
+                    <Repeat size={12} /> 其他场次占用信息
+                  </p>
+                  <p className="font-medium text-slate-800">
+                    {otherExam?.name || "未知考试"}
+                  </p>
+                  <p className="text-xs text-slate-500 mt-1">
+                    {otherExam && new Date(otherExam.startTime).toLocaleString("zh-CN")}
+                  </p>
+                  {student && (
+                    <p className="text-xs text-slate-600 mt-1">
+                      考生: {student.name} ({student.school})
+                    </p>
+                  )}
+                  <p className="text-xs text-emerald-600 mt-2 flex items-center gap-1">
+                    <ShieldCheck size={12} /> 与当前考试时间不冲突，可复用
+                  </p>
+                </div>
+              );
+            })()}
+
             {getAssignedStudent(viewingSeat.id) && (
               <div className="p-4 bg-primary-50 rounded-xl border border-primary-200">
                 <p className="text-xs text-primary-600 mb-1">分配考生</p>
@@ -299,7 +457,9 @@ const LockingMatrix: React.FC = () => {
               </div>
             )}
 
-            {viewingSeat.status === "available" && !viewingSeat.isLocked && (
+            {(!selectedExamId || getSeatStatusForExam(viewingSeat.id, selectedExamId).status === "available") &&
+              !viewingSeat.isLocked &&
+              viewingSeat.status !== "disabled" && (
               <div className="space-y-3 pt-3 border-t border-slate-100">
                 <div>
                   <label className="block text-sm font-medium text-slate-700 mb-1.5">

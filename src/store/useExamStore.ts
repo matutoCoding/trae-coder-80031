@@ -41,8 +41,22 @@ interface ExamStore {
   lockSeat: (seatId: string, reason: string) => void;
   unlockSeat: (seatId: string) => void;
 
+  getOverlappingExamIds: (examId: string) => Set<string>;
+  isSeatOccupiedAtExam: (seatId: string, examId: string) => Assignment | undefined;
+  isSeatLockedAtExam: (seatId: string, examId: string) => boolean;
+  getAvailableSeatsForExam: (examId: string) => Seat[];
+  getSeatStatusForExam: (
+    seatId: string,
+    examId: string
+  ) => {
+    status: "available" | "occupied-current" | "occupied-other" | "locked" | "disabled";
+    assignment?: Assignment;
+  };
+  getRoomOccupancyForExam: (examId: string) => Map<string, number>;
+
   runAutoAllocation: (examId: string) => AllocationResult;
   confirmAssignment: (assignmentId: string) => void;
+  confirmAllAssignments: (examId: string) => number;
   cancelAssignment: (assignmentId: string) => void;
 
   generateTicket: (assignmentId: string) => Ticket;
@@ -56,7 +70,16 @@ interface ExamStore {
   resolveConflict: (conflictId: string) => void;
 }
 
-const STORAGE_KEY = "exam_seat_allocation_data";
+const STORAGE_KEY = "exam_seat_allocation_data_v2";
+
+const isExamTimeOverlap = (examA: Exam, examB: Exam): boolean => {
+  if (examA.id === examB.id) return false;
+  const startA = new Date(examA.startTime).getTime();
+  const endA = new Date(examA.endTime).getTime();
+  const startB = new Date(examB.startTime).getTime();
+  const endB = new Date(examB.endTime).getTime();
+  return startA < endB && startB < endA;
+};
 
 const loadFromStorage = () => {
   try {
@@ -102,7 +125,8 @@ const saveToStorage = (state: Partial<ExamStore>) => {
 const calculateContiguityScore = (
   seat: Seat,
   allSeats: Seat[],
-  seatsMap: Map<string, Seat>
+  occupiedSeatIds: Set<string>,
+  lockedSeatIds: Set<string>
 ): number => {
   let score = 0;
   const directions = [
@@ -117,8 +141,9 @@ const calculateContiguityScore = (
         s.roomId === seat.roomId &&
         s.rowNum === seat.rowNum + dr &&
         s.colNum === seat.colNum + dc &&
-        s.status === "available" &&
-        !s.isLocked
+        !occupiedSeatIds.has(s.id) &&
+        !lockedSeatIds.has(s.id) &&
+        s.status !== "disabled"
     );
     if (neighbor) score++;
   });
@@ -126,12 +151,12 @@ const calculateContiguityScore = (
 };
 
 const isSameSchoolNearby = (
-    seat: Seat,
-    student: Student,
-    assignments: Assignment[],
-    students: Student[],
-    seats: Seat[]
-  ): boolean => {
+  seat: Seat,
+  student: Student,
+  assignments: Assignment[],
+  students: Student[],
+  seats: Seat[]
+): boolean => {
   const directions = [
     [-1, 0],
     [1, 0],
@@ -203,7 +228,9 @@ export const useExamStore = create<ExamStore>((set, get) => ({
     set((state) => {
       const updated = {
         ...state,
-        examRooms: state.examRooms.map((r) => (r.id === id ? { ...r, ...room } : r)),
+        examRooms: state.examRooms.map((r) =>
+          r.id === id ? { ...r, ...room } : r
+        ),
       };
       saveToStorage(updated);
       return updated;
@@ -313,7 +340,13 @@ export const useExamStore = create<ExamStore>((set, get) => ({
         ...state,
         seats: state.seats.map((s) =>
           s.id === seatId
-            ? { ...s, isLocked: false, lockReason: undefined, lockedAt: undefined, lockedBy: undefined }
+            ? {
+                ...s,
+                isLocked: false,
+                lockReason: undefined,
+                lockedAt: undefined,
+                lockedBy: undefined,
+              }
             : s
         ),
       };
@@ -321,67 +354,188 @@ export const useExamStore = create<ExamStore>((set, get) => ({
       return updated;
     }),
 
-  runAutoAllocation: (examId) => {
+  getOverlappingExamIds: (examId) => {
     const state = get();
-    const config = state.allocationConfig;
-    const examStudents = state.students.filter((s) => s.examId === examId && !s.assignedSeatId);
+    const targetExam = state.exams.find((e) => e.id === examId);
+    if (!targetExam) return new Set<string>();
+    const overlappingIds = new Set<string>();
+    state.exams.forEach((e) => {
+      if (isExamTimeOverlap(targetExam, e)) {
+        overlappingIds.add(e.id);
+      }
+    });
+    overlappingIds.add(examId);
+    return overlappingIds;
+  },
+
+  isSeatOccupiedAtExam: (seatId, examId) => {
+    const state = get();
+    const overlappingExamIds = state.getOverlappingExamIds(examId);
+    return state.assignments.find(
+      (a) =>
+        a.seatId === seatId &&
+        overlappingExamIds.has(a.examId) &&
+        a.status !== "cancelled"
+    );
+  },
+
+  isSeatLockedAtExam: (seatId, examId) => {
+    const state = get();
+    const seat = state.seats.find((s) => s.id === seatId);
+    if (!seat) return true;
+    if (seat.status === "disabled") return true;
+    if (seat.isLocked && seat.lockedBy === "admin") return true;
+    return false;
+  },
+
+  getAvailableSeatsForExam: (examId) => {
+    const state = get();
+    return state.seats.filter((s) => {
+      if (s.status === "disabled") return false;
+      if (s.isLocked && s.lockedBy === "admin") return false;
+      if (state.isSeatOccupiedAtExam(s.id, examId)) return false;
+      return true;
+    });
+  },
+
+  getSeatStatusForExam: (seatId, examId) => {
+    const state = get();
+    const seat = state.seats.find((s) => s.id === seatId);
+    if (!seat) return { status: "disabled" as const };
+    if (seat.status === "disabled") return { status: "disabled" as const };
+    if (seat.isLocked && seat.lockedBy === "admin")
+      return { status: "locked" as const };
+
+    const overlappingExamIds = state.getOverlappingExamIds(examId);
+    const assignment = state.assignments.find(
+      (a) =>
+        a.seatId === seatId &&
+        overlappingExamIds.has(a.examId) &&
+        a.status !== "cancelled"
+    );
+    if (assignment) {
+      if (assignment.examId === examId) {
+        return { status: "occupied-current" as const, assignment };
+      }
+      return { status: "occupied-other" as const, assignment };
+    }
+    return { status: "available" as const };
+  },
+
+  getRoomOccupancyForExam: (examId) => {
+    const state = get();
     const examAssignments = state.assignments.filter(
       (a) => a.examId === examId && a.status !== "cancelled"
     );
-    const assignedSeatIds = new Set(examAssignments.map((a) => a.seatId));
-    const assignedStudentIds = new Set(examAssignments.map((a) => a.studentId));
+    const occupancy = new Map<string, number>();
+    state.examRooms.forEach((r) => occupancy.set(r.id, 0));
+    examAssignments.forEach((a) => {
+      const seat = state.seats.find((s) => s.id === a.seatId);
+      if (seat) {
+        const current = occupancy.get(seat.roomId) || 0;
+        occupancy.set(seat.roomId, current + 1);
+      }
+    });
+    return occupancy;
+  },
 
-    const availableSeats = state.seats.filter(
-      (s) =>
-        s.status === "available" && !s.isLocked && !assignedSeatIds.has(s.id)
+  runAutoAllocation: (examId) => {
+    const state = get();
+    const config = state.allocationConfig;
+    const exam = state.exams.find((e) => e.id === examId);
+
+    const examStudents = state.students.filter(
+      (s) => s.examId === examId && !s.assignedSeatId
+    );
+    const currentExamAssignments = state.assignments.filter(
+      (a) => a.examId === examId && a.status !== "cancelled"
+    );
+    const assignedStudentIds = new Set(
+      currentExamAssignments.map((a) => a.studentId)
     );
 
     const unassignedStudents = examStudents.filter(
       (s) => !assignedStudentIds.has(s.id)
     );
 
+    const availableSeats = state.getAvailableSeatsForExam(examId);
+
     const newAssignments: Assignment[] = [];
     const newConflicts: ConflictLog[] = [];
     const rooms = state.examRooms;
-    const roomOccupancy = new Map<string, number>();
 
-    rooms.forEach((r) => {
-      const count = state.seats.filter(
-        (s) => s.roomId === r.id && assignedSeatIds.has(s.id)
-      ).length;
-      roomOccupancy.set(r.id, count);
-    });
+    const roomOccupancy = state.getRoomOccupancyForExam(examId);
+
+    const totalAvailable = availableSeats.length;
+    const totalRooms = rooms.length;
+    const totalToAssign = unassignedStudents.length + currentExamAssignments.length;
+    const targetPerRoom = totalRooms > 0 ? Math.ceil(totalToAssign / totalRooms) : 0;
 
     const seatsMap = new Map(state.seats.map((s) => [s.id, s]));
 
-    let workingAssignments = [...examAssignments];
-    let workingSeats = [...availableSeats];
+    let workingAssignments = [...currentExamAssignments];
+    let workingAvailableSeats = [...availableSeats];
+
+    const occupiedSeatIdsForExam = new Set<string>();
+    currentExamAssignments.forEach((a) => occupiedSeatIdsForExam.add(a.seatId));
+
+    const lockedSeatIds = new Set<string>();
+    state.seats.forEach((s) => {
+      if (s.status === "disabled" || (s.isLocked && s.lockedBy === "admin")) {
+        lockedSeatIds.add(s.id);
+      }
+    });
 
     for (const student of unassignedStudents) {
-      let candidateSeats = [...workingSeats];
+      let candidateSeats = [...workingAvailableSeats];
 
       if (config.loadBalance) {
-        candidateSeats.sort((a, b) => {
-          const occA = roomOccupancy.get(a.roomId) || 0;
-          const occB = roomOccupancy.get(b.roomId) || 0;
-          return occA - occB;
+        candidateSeats = candidateSeats.filter((seat) => {
+          const currentOcc = roomOccupancy.get(seat.roomId) || 0;
+          return currentOcc < targetPerRoom;
         });
+        if (candidateSeats.length === 0) {
+          candidateSeats = [...workingAvailableSeats];
+        }
       }
 
-      if (config.preferContiguous || config.avoidFragmentation) {
-        candidateSeats.sort((a, b) => {
-          const scoreA = calculateContiguityScore(a, workingSeats, seatsMap);
-          const scoreB = calculateContiguityScore(b, workingSeats, seatsMap);
-          return scoreB - scoreA;
-        });
-      }
+      candidateSeats.sort((a, b) => {
+        const occA = roomOccupancy.get(a.roomId) || 0;
+        const occB = roomOccupancy.get(b.roomId) || 0;
+        if (occA !== occB) return occA - occB;
+
+        if (config.preferContiguous || config.avoidFragmentation) {
+          const scoreA = calculateContiguityScore(
+            a,
+            workingAvailableSeats,
+            occupiedSeatIdsForExam,
+            lockedSeatIds
+          );
+          const scoreB = calculateContiguityScore(
+            b,
+            workingAvailableSeats,
+            occupiedSeatIdsForExam,
+            lockedSeatIds
+          );
+          if (scoreA !== scoreB) return scoreB - scoreA;
+        }
+
+        if (a.rowNum !== b.rowNum) return a.rowNum - b.rowNum;
+        return a.colNum - b.colNum;
+      });
 
       let selectedSeat: Seat | undefined;
 
       for (const seat of candidateSeats) {
         if (
           config.avoidSameSchool &&
-          isSameSchoolNearby(seat, student, workingAssignments, state.students, state.seats)
+          isSameSchoolNearby(
+            seat,
+            student,
+            workingAssignments,
+            state.students,
+            state.seats
+          )
         ) {
           continue;
         }
@@ -405,8 +559,11 @@ export const useExamStore = create<ExamStore>((set, get) => ({
 
         newAssignments.push(assignment);
         workingAssignments.push(assignment);
-        workingSeats = workingSeats.filter((s) => s.id !== selectedSeat!.id);
-        
+        workingAvailableSeats = workingAvailableSeats.filter(
+          (s) => s.id !== selectedSeat!.id
+        );
+        occupiedSeatIdsForExam.add(selectedSeat.id);
+
         const currentOcc = roomOccupancy.get(selectedSeat.roomId) || 0;
         roomOccupancy.set(selectedSeat.roomId, currentOcc + 1);
       } else {
@@ -423,8 +580,13 @@ export const useExamStore = create<ExamStore>((set, get) => ({
     }
 
     let fragmentedCount = 0;
-    workingSeats.forEach((seat) => {
-      const score = calculateContiguityScore(seat, workingSeats, seatsMap);
+    workingAvailableSeats.forEach((seat) => {
+      const score = calculateContiguityScore(
+        seat,
+        workingAvailableSeats,
+        occupiedSeatIdsForExam,
+        lockedSeatIds
+      );
       if (score === 0) fragmentedCount++;
     });
 
@@ -434,20 +596,11 @@ export const useExamStore = create<ExamStore>((set, get) => ({
         assignments: [...prevState.assignments, ...newAssignments],
         conflicts: [...prevState.conflicts, ...newConflicts],
         students: prevState.students.map((s) => {
-          const assignment = newAssignments.find((a) => a.studentId === s.id);
-          return assignment ? { ...s, assignedSeatId: assignment.seatId } : s;
-        }),
-        seats: prevState.seats.map((s) => {
-          const assigned = newAssignments.find((a) => a.seatId === s.id);
-          return assigned
-            ? {
-                ...s,
-                isLocked: true,
-                status: "occupied" as const,
-                lockReason: "已分配考位",
-                lockedAt: new Date(),
-                lockedBy: "system",
-              }
+          const assignment = newAssignments.find(
+            (a) => a.studentId === s.id
+          );
+          return assignment
+            ? { ...s, assignedSeatId: assignment.seatId }
             : s;
         }),
       };
@@ -479,6 +632,25 @@ export const useExamStore = create<ExamStore>((set, get) => ({
       return updated;
     }),
 
+  confirmAllAssignments: (examId) => {
+    let count = 0;
+    set((state) => {
+      const updated = {
+        ...state,
+        assignments: state.assignments.map((a) => {
+          if (a.examId === examId && a.status === "pending") {
+            count++;
+            return { ...a, status: "confirmed" as const };
+          }
+          return a;
+        }),
+      };
+      saveToStorage(updated);
+      return updated;
+    });
+    return count;
+  },
+
   cancelAssignment: (assignmentId) =>
     set((state) => {
       const assignment = state.assignments.find((a) => a.id === assignmentId);
@@ -486,18 +658,6 @@ export const useExamStore = create<ExamStore>((set, get) => ({
         ...state,
         assignments: state.assignments.map((a) =>
           a.id === assignmentId ? { ...a, status: "cancelled" as const } : a
-        ),
-        seats: state.seats.map((s) =>
-          assignment && s.id === assignment.seatId
-            ? {
-                ...s,
-                isLocked: false,
-                status: "available" as const,
-                lockReason: undefined,
-                lockedAt: undefined,
-                lockedBy: undefined,
-              }
-            : s
         ),
         students: state.students.map((s) =>
           assignment && s.id === assignment.studentId
@@ -518,7 +678,9 @@ export const useExamStore = create<ExamStore>((set, get) => ({
     const exam = state.exams.find((e) => e.id === assignment.examId);
     const seat = state.seats.find((s) => s.id === assignment.seatId);
     const room = state.examRooms.find((r) => r.id === seat?.roomId);
-    const ticketNo = `ZK${Date.now()}${Math.floor(Math.random() * 1000).toString().padStart(4, "0")}`;
+    const ticketNo = `ZK${Date.now()}${Math.floor(Math.random() * 1000)
+      .toString()
+      .padStart(4, "0")}`;
 
     const ticket: Ticket = {
       id: generateId(),
@@ -529,9 +691,17 @@ export const useExamStore = create<ExamStore>((set, get) => ({
       idCard: student?.idCard || "",
       school: student?.school || "",
       examName: exam?.name || "",
-      examDate: exam ? new Date(exam.startTime).toLocaleDateString("zh-CN") : "",
+      examDate: exam
+        ? new Date(exam.startTime).toLocaleDateString("zh-CN")
+        : "",
       examTime: exam
-        ? `${new Date(exam.startTime).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })}-${new Date(exam.endTime).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })}`
+        ? `${new Date(exam.startTime).toLocaleTimeString("zh-CN", {
+            hour: "2-digit",
+            minute: "2-digit",
+          })}-${new Date(exam.endTime).toLocaleTimeString("zh-CN", {
+            hour: "2-digit",
+            minute: "2-digit",
+          })}`
         : "",
       examRoomName: room?.name || "",
       building: room?.building || "",
@@ -553,7 +723,7 @@ export const useExamStore = create<ExamStore>((set, get) => ({
   generateTicketsBatch: (examId) => {
     const state = get();
     const examAssignments = state.assignments.filter(
-      (a) => a.examId === examId && a.status !== "cancelled"
+      (a) => a.examId === examId && a.status === "confirmed"
     );
     const existingAssignmentIds = new Set(
       state.tickets.map((t) => t.assignmentId)
@@ -578,9 +748,17 @@ export const useExamStore = create<ExamStore>((set, get) => ({
         idCard: student?.idCard || "",
         school: student?.school || "",
         examName: exam?.name || "",
-        examDate: exam ? new Date(exam.startTime).toLocaleDateString("zh-CN") : "",
+        examDate: exam
+          ? new Date(exam.startTime).toLocaleDateString("zh-CN")
+          : "",
         examTime: exam
-          ? `${new Date(exam.startTime).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })}-${new Date(exam.endTime).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })}`
+          ? `${new Date(exam.startTime).toLocaleTimeString("zh-CN", {
+              hour: "2-digit",
+              minute: "2-digit",
+            })}-${new Date(exam.endTime).toLocaleTimeString("zh-CN", {
+              hour: "2-digit",
+              minute: "2-digit",
+            })}`
           : "",
         examRoomName: room?.name || "",
         building: room?.building || "",

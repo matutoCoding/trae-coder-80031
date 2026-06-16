@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useMemo } from "react";
 import { useExamStore } from "@/store/useExamStore";
 import {
   Shuffle,
@@ -13,6 +13,7 @@ import {
   CheckCircle2,
   ShieldCheck,
   School,
+  BarChart3,
 } from "lucide-react";
 import SeatGrid from "@/components/SeatGrid";
 import Modal from "@/components/Modal";
@@ -28,9 +29,13 @@ const AutoAllocation: React.FC = () => {
     allocationConfig,
     runAutoAllocation,
     confirmAssignment,
+    confirmAllAssignments,
     cancelAssignment,
     updateAllocationConfig,
     initData,
+    getOverlappingExamIds,
+    getAvailableSeatsForExam,
+    getRoomOccupancyForExam,
   } = useExamStore();
 
   const [selectedExamId, setSelectedExamId] = useState(exams[0]?.id || "");
@@ -61,10 +66,47 @@ const AutoAllocation: React.FC = () => {
   const unassignedStudents = examStudents.filter(
     (s) => !examAssignments.some((a) => a.studentId === s.id)
   );
-
-  const totalExamSeats = seats.filter(
-    (s) => s.status === "available" && !s.isLocked
+  const confirmedCount = examAssignments.filter(
+    (a) => a.status === "confirmed"
   ).length;
+  const pendingCount = examAssignments.filter(
+    (a) => a.status === "pending"
+  ).length;
+
+  const availableSeats = useMemo(
+    () => (selectedExamId ? getAvailableSeatsForExam(selectedExamId) : []),
+    [selectedExamId, assignments, seats, exams]
+  );
+
+  const overlappingExamIds = useMemo(
+    () => (selectedExamId ? getOverlappingExamIds(selectedExamId) : new Set()),
+    [selectedExamId, exams, assignments]
+  );
+
+  const occupiedOtherSeatIds = useMemo(() => {
+    const ids = new Set<string>();
+    assignments.forEach((a) => {
+      if (
+        a.status !== "cancelled" &&
+        a.examId !== selectedExamId &&
+        overlappingExamIds.has(a.examId)
+      ) {
+        ids.add(a.seatId);
+      }
+    });
+    return ids;
+  }, [assignments, overlappingExamIds, selectedExamId]);
+
+  const roomOccupancy = useMemo(
+    () => (selectedExamId ? getRoomOccupancyForExam(selectedExamId) : new Map()),
+    [selectedExamId, assignments, seats]
+  );
+
+  const maxOccupancy = Math.max(...Array.from(roomOccupancy.values()), 0);
+  const minOccupancy = Math.min(
+    ...Array.from(roomOccupancy.values()).filter((v) => v > 0),
+    0
+  );
 
   const handleRunAllocation = () => {
     const result = runAutoAllocation(selectedExamId);
@@ -73,13 +115,24 @@ const AutoAllocation: React.FC = () => {
   };
 
   const handleConfirmAll = () => {
-    if (lastResult) {
-      lastResult.assignments.forEach((a) => confirmAssignment(a.id));
+    if (lastResult && lastResult.assignments.length > 0) {
+      const count = confirmAllAssignments(selectedExamId);
+      setLastResult(null);
       setShowResult(false);
+    } else {
+      if (confirm("确认将该考试所有待确认的分配全部生效？")) {
+        confirmAllAssignments(selectedExamId);
+      }
     }
   };
 
   const configOptions = [
+    {
+      key: "loadBalance",
+      label: "负载均衡",
+      desc: "各考场人数尽量均等，优先分配人数少的考场",
+      icon: <BarChart3 size={18} />,
+    },
     {
       key: "avoidFragmentation",
       label: "碎片避免",
@@ -87,10 +140,10 @@ const AutoAllocation: React.FC = () => {
       icon: <Sparkles size={18} />,
     },
     {
-      key: "loadBalance",
-      label: "负载均衡",
-      desc: "均匀分配各考场考位使用率",
-      icon: <Building2 size={18} />,
+      key: "preferContiguous",
+      label: "连续优先",
+      desc: "在同一考场内优先分配连续的座位",
+      icon: <Armchair size={18} />,
     },
     {
       key: "avoidSameSchool",
@@ -98,21 +151,30 @@ const AutoAllocation: React.FC = () => {
       desc: "同校考生不安排相邻座位",
       icon: <School size={18} />,
     },
-    {
-      key: "preferContiguous",
-      label: "连续优先",
-      desc: "优先分配连续区域的考位",
-      icon: <Armchair size={18} />,
-    },
   ];
+
+  const getStudent = (id: string) => students.find((s) => s.id === id);
+  const getSeat = (id: string) => seats.find((s) => s.id === id);
+  const getRoom = (id: string) => examRooms.find((r) => r.id === id);
 
   return (
     <div className="space-y-6 animate-fade-in">
-      <div>
-        <h1 className="text-2xl font-bold text-slate-800">智能编排</h1>
-        <p className="text-slate-500 text-sm mt-1">
-          系统自动择优分配考位，支持碎片避免、负载均衡、同校避开
-        </p>
+      <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4">
+        <div>
+          <h1 className="text-2xl font-bold text-slate-800">智能编排</h1>
+          <p className="text-slate-500 text-sm mt-1">
+            系统自动择优分配考位，负载均衡优先，碎片避免、同校避开
+          </p>
+        </div>
+        {pendingCount > 0 && (
+          <button
+            onClick={handleConfirmAll}
+            className="flex items-center gap-2 px-5 py-2.5 bg-emerald-500 text-white rounded-xl font-medium hover:bg-emerald-600 transition-colors"
+          >
+            <CheckCircle2 size={18} />
+            确认全部待确认 ({pendingCount})
+          </button>
+        )}
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
@@ -130,7 +192,13 @@ const AutoAllocation: React.FC = () => {
                 >
                   {exams.map((e) => (
                     <option key={e.id} value={e.id}>
-                      {e.name}
+                      {e.name} -{" "}
+                      {new Date(e.startTime).toLocaleDateString("zh-CN", {
+                        month: "2-digit",
+                        day: "2-digit",
+                        hour: "2-digit",
+                        minute: "2-digit",
+                      })}
                     </option>
                   ))}
                 </select>
@@ -148,27 +216,96 @@ const AutoAllocation: React.FC = () => {
             </div>
 
             {currentExam && (
-              <div className="grid grid-cols-3 gap-4 mt-5 pt-5 border-t border-slate-100">
+              <div className="grid grid-cols-2 md:grid-cols-5 gap-3 mt-5 pt-5 border-t border-slate-100">
                 <div className="text-center p-3 bg-slate-50 rounded-xl">
-                  <Users size={20} className="mx-auto mb-1 text-primary-500" />
+                  <Users size={18} className="mx-auto mb-1 text-primary-500" />
                   <p className="text-xs text-slate-500">考生总数</p>
-                  <p className="text-xl font-bold text-slate-800">
+                  <p className="text-lg font-bold text-slate-800">
                     {examStudents.length}
                   </p>
                 </div>
                 <div className="text-center p-3 bg-emerald-50 rounded-xl">
-                  <CheckCircle2 size={20} className="mx-auto mb-1 text-emerald-500" />
-                  <p className="text-xs text-slate-500">已分配</p>
-                  <p className="text-xl font-bold text-emerald-600">
-                    {examAssignments.length}
+                  <CheckCircle2
+                    size={18}
+                    className="mx-auto mb-1 text-emerald-500"
+                  />
+                  <p className="text-xs text-slate-500">已确认</p>
+                  <p className="text-lg font-bold text-emerald-600">
+                    {confirmedCount}
+                  </p>
+                </div>
+                <div className="text-center p-3 bg-primary-50 rounded-xl">
+                  <Armchair size={18} className="mx-auto mb-1 text-primary-500" />
+                  <p className="text-xs text-slate-500">待确认</p>
+                  <p className="text-lg font-bold text-primary-600">
+                    {pendingCount}
                   </p>
                 </div>
                 <div className="text-center p-3 bg-warning-50 rounded-xl">
-                  <AlertTriangle size={20} className="mx-auto mb-1 text-warning-500" />
+                  <AlertTriangle
+                    size={18}
+                    className="mx-auto mb-1 text-warning-500"
+                  />
                   <p className="text-xs text-slate-500">待分配</p>
-                  <p className="text-xl font-bold text-warning-600">
+                  <p className="text-lg font-bold text-warning-600">
                     {unassignedStudents.length}
                   </p>
+                </div>
+                <div className="text-center p-3 bg-accent-50 rounded-xl">
+                  <Sparkles size={18} className="mx-auto mb-1 text-accent-500" />
+                  <p className="text-xs text-slate-500">可用考位</p>
+                  <p className="text-lg font-bold text-accent-600">
+                    {availableSeats.length}
+                  </p>
+                </div>
+              </div>
+            )}
+
+            {examRooms.length > 0 && (
+              <div className="mt-4 pt-4 border-t border-slate-100">
+                <p className="text-xs text-slate-500 mb-2 flex items-center gap-1">
+                  <BarChart3 size={12} /> 各考场分配人数
+                  {maxOccupancy > 0 && (
+                    <span className="ml-auto">
+                      均衡差: {maxOccupancy - minOccupancy}人
+                    </span>
+                  )}
+                </p>
+                <div className="grid grid-cols-2 md:grid-cols-3 gap-2">
+                  {examRooms.map((room) => {
+                    const occ = roomOccupancy.get(room.id) || 0;
+                    const total = seats.filter(
+                      (s) => s.roomId === room.id && s.status !== "disabled"
+                    ).length;
+                    const percent = total > 0 ? (occ / total) * 100 : 0;
+                    return (
+                      <div
+                        key={room.id}
+                        className="p-2 bg-slate-50 rounded-lg"
+                      >
+                        <div className="flex justify-between items-center text-xs mb-1">
+                          <span className="font-medium text-slate-700 truncate max-w-[100px]">
+                            {room.name}
+                          </span>
+                          <span className="text-slate-500">
+                            {occ}/{total}
+                          </span>
+                        </div>
+                        <div className="h-1.5 bg-slate-200 rounded-full overflow-hidden">
+                          <div
+                            className={`h-full rounded-full transition-all ${
+                              percent > 80
+                                ? "bg-warning-500"
+                                : percent > 50
+                                ? "bg-primary-500"
+                                : "bg-emerald-500"
+                            }`}
+                            style={{ width: `${percent}%` }}
+                          />
+                        </div>
+                      </div>
+                    );
+                  })}
                 </div>
               </div>
             )}
@@ -194,9 +331,13 @@ const AutoAllocation: React.FC = () => {
                 seats={seats.filter((s) => s.roomId === currentRoom.id)}
                 rows={currentRoom.rows}
                 cols={currentRoom.cols}
-                assignments={examAssignments}
+                assignments={assignments.filter(
+                  (a) => a.status !== "cancelled"
+                )}
                 students={students}
                 onSeatClick={(seat) => setViewingSeat(seat)}
+                examId={selectedExamId}
+                occupiedOtherSeatIds={occupiedOtherSeatIds}
               />
             )}
           </div>
@@ -220,9 +361,9 @@ const AutoAllocation: React.FC = () => {
                   </thead>
                   <tbody>
                     {examAssignments.map((a) => {
-                      const student = students.find((s) => s.id === a.studentId);
-                      const seat = seats.find((s) => s.id === a.seatId);
-                      const room = examRooms.find((r) => r.id === seat?.roomId);
+                      const student = getStudent(a.studentId);
+                      const seat = getSeat(a.seatId);
+                      const room = seat ? getRoom(seat.roomId) : null;
                       return (
                         <tr
                           key={a.id}
@@ -236,8 +377,12 @@ const AutoAllocation: React.FC = () => {
                               {student?.school}
                             </span>
                           </td>
-                          <td className="px-5 py-3 text-slate-600">{room?.name}</td>
-                          <td className="px-5 py-3 text-slate-600">{seat?.seatNo}</td>
+                          <td className="px-5 py-3 text-slate-600">
+                            {room?.name}
+                          </td>
+                          <td className="px-5 py-3 text-slate-600">
+                            {seat?.seatNo}
+                          </td>
                           <td className="px-5 py-3">
                             {a.status === "confirmed" ? (
                               <span className="px-2 py-0.5 bg-emerald-50 text-emerald-700 rounded text-xs font-medium">
@@ -265,6 +410,14 @@ const AutoAllocation: React.FC = () => {
                                   <X size={16} />
                                 </button>
                               </div>
+                            )}
+                            {a.status === "confirmed" && (
+                              <button
+                                onClick={() => cancelAssignment(a.id)}
+                                className="p-1.5 rounded-lg hover:bg-red-50 text-red-500 transition-colors text-xs"
+                              >
+                                取消
+                              </button>
                             )}
                           </td>
                         </tr>
@@ -325,11 +478,11 @@ const AutoAllocation: React.FC = () => {
             <ul className="space-y-2 text-sm text-white/90">
               <li className="flex items-start gap-2">
                 <Check size={16} className="mt-0.5 flex-shrink-0" />
-                <span>系统从空闲考位中择优分配</span>
+                <span>负载均衡优先，各考场人数尽量接近</span>
               </li>
               <li className="flex items-start gap-2">
                 <Check size={16} className="mt-0.5 flex-shrink-0" />
-                <span>分配成功的考位立即互斥锁定</span>
+                <span>不同考试时间的考位可复用，时间重叠才互斥</span>
               </li>
               <li className="flex items-start gap-2">
                 <Check size={16} className="mt-0.5 flex-shrink-0" />
@@ -337,7 +490,7 @@ const AutoAllocation: React.FC = () => {
               </li>
               <li className="flex items-start gap-2">
                 <Check size={16} className="mt-0.5 flex-shrink-0" />
-                <span>可手动取消分配并释放考位</span>
+                <span>确认后才能在准考证生成页生成准考证</span>
               </li>
             </ul>
           </div>
@@ -348,13 +501,19 @@ const AutoAllocation: React.FC = () => {
               <div className="flex justify-between items-center">
                 <span className="text-slate-500">可用考位</span>
                 <span className="font-semibold text-slate-800">
-                  {totalExamSeats}
+                  {availableSeats.length}
                 </span>
               </div>
               <div className="flex justify-between items-center">
                 <span className="text-slate-500">考场数量</span>
                 <span className="font-semibold text-slate-800">
                   {examRooms.length}
+                </span>
+              </div>
+              <div className="flex justify-between items-center">
+                <span className="text-slate-500">时间冲突场次</span>
+                <span className="font-semibold text-slate-800">
+                  {Math.max(0, overlappingExamIds.size - 1)}
                 </span>
               </div>
               <div className="flex justify-between items-center">
@@ -473,7 +632,7 @@ const AutoAllocation: React.FC = () => {
                   onClick={handleConfirmAll}
                   className="flex-1 px-5 py-2.5 bg-gradient-primary text-white rounded-xl text-sm font-medium hover:shadow-lg transition-all"
                 >
-                  全部确认
+                  全部确认并生效
                 </button>
               )}
             </div>
@@ -498,7 +657,7 @@ const AutoAllocation: React.FC = () => {
               <div className="p-3 bg-slate-50 rounded-lg">
                 <p className="text-slate-500 text-xs">考场</p>
                 <p className="font-medium text-slate-800 mt-0.5">
-                  {examRooms.find((r) => r.id === viewingSeat.roomId)?.name}
+                  {getRoom(viewingSeat.roomId)?.name}
                 </p>
               </div>
               <div className="p-3 bg-slate-50 rounded-lg">
@@ -508,16 +667,55 @@ const AutoAllocation: React.FC = () => {
                 </p>
               </div>
             </div>
-            <div className="p-3 bg-slate-50 rounded-lg">
-              <p className="text-slate-500 text-xs">状态</p>
-              <p className="font-medium mt-0.5">
-                {viewingSeat.isLocked
-                  ? "已锁定"
-                  : viewingSeat.status === "occupied"
-                  ? "已占用"
-                  : "空闲"}
-              </p>
-            </div>
+
+            {selectedExamId && (
+              <div className="p-4 bg-primary-50 rounded-xl border border-primary-100">
+                <p className="text-xs text-primary-600 mb-2">
+                  当前考试场次状态
+                </p>
+                {(() => {
+                  const assignment = examAssignments.find(
+                    (a) => a.seatId === viewingSeat.id
+                  );
+                  const isOtherOccupied = occupiedOtherSeatIds.has(
+                    viewingSeat.id
+                  );
+                  if (viewingSeat.status === "disabled")
+                    return <p className="font-medium text-slate-500">不可用</p>;
+                  if (viewingSeat.isLocked && viewingSeat.lockedBy === "admin")
+                    return (
+                      <p className="font-medium text-warning-600">
+                        已手动锁定: {viewingSeat.lockReason}
+                      </p>
+                    );
+                  if (assignment) {
+                    const stu = getStudent(assignment.studentId);
+                    return (
+                      <div>
+                        <p className="font-semibold text-primary-700">
+                          已分配给 {stu?.name}
+                        </p>
+                        <p className="text-xs text-primary-600 mt-0.5">
+                          {stu?.school} · 状态:{" "}
+                          {assignment.status === "confirmed"
+                            ? "已确认"
+                            : "待确认"}
+                        </p>
+                      </div>
+                    );
+                  }
+                  if (isOtherOccupied)
+                    return (
+                      <p className="font-medium text-slate-600">
+                        被其他时间重叠场次占用
+                      </p>
+                    );
+                  return (
+                    <p className="font-semibold text-emerald-600">空闲可用</p>
+                  );
+                })()}
+              </div>
+            )}
           </div>
         )}
       </Modal>

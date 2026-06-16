@@ -1,7 +1,7 @@
 import React from "react";
 import { Seat, Student, Assignment } from "@/types";
 import { cn } from "@/lib/utils";
-import { Lock, User, X } from "lucide-react";
+import { Lock, User, X, AlertTriangle } from "lucide-react";
 
 interface SeatGridProps {
   seats: Seat[];
@@ -11,6 +11,8 @@ interface SeatGridProps {
   students?: Student[];
   onSeatClick?: (seat: Seat) => void;
   showLabels?: boolean;
+  examId?: string;
+  occupiedOtherSeatIds?: Set<string>;
 }
 
 const SeatGrid: React.FC<SeatGridProps> = ({
@@ -21,6 +23,8 @@ const SeatGrid: React.FC<SeatGridProps> = ({
   students = [],
   onSeatClick,
   showLabels = true,
+  examId,
+  occupiedOtherSeatIds,
 }) => {
   const getSeatAt = (row: number, col: number) =>
     seats.find((s) => s.rowNum === row && s.colNum === col);
@@ -28,7 +32,20 @@ const SeatGrid: React.FC<SeatGridProps> = ({
   const getSeatStatus = (seat: Seat | undefined) => {
     if (!seat) return "empty";
     if (seat.status === "disabled") return "disabled";
-    if (seat.isLocked) return "locked";
+    if (seat.isLocked && seat.lockedBy === "admin") return "locked";
+    if (examId) {
+      const assignment = assignments.find(
+        (a) =>
+          a.seatId === seat.id &&
+          a.status !== "cancelled" &&
+          a.examId === examId
+      );
+      if (assignment) return "occupied";
+      if (occupiedOtherSeatIds && occupiedOtherSeatIds.has(seat.id)) {
+        return "occupied-other";
+      }
+      return "available";
+    }
     const assignment = assignments.find(
       (a) => a.seatId === seat.id && a.status !== "cancelled"
     );
@@ -49,11 +66,22 @@ const SeatGrid: React.FC<SeatGridProps> = ({
       "bg-emerald-50 border-emerald-200 text-emerald-700 hover:bg-emerald-100 hover:border-emerald-300 cursor-pointer",
     occupied:
       "bg-primary-100 border-primary-300 text-primary-800 cursor-pointer",
+    "occupied-other":
+      "bg-slate-200 border-slate-300 text-slate-500 cursor-not-allowed",
     locked:
       "bg-warning-50 border-warning-300 text-warning-700 cursor-pointer",
     disabled:
       "bg-slate-100 border-slate-200 text-slate-400 cursor-not-allowed",
     empty: "bg-transparent border-transparent",
+  };
+
+  const statusLabels: Record<string, string> = {
+    available: "空闲可用",
+    occupied: "已分配(本场)",
+    "occupied-other": "被其他场次占用",
+    locked: "已锁定",
+    disabled: "不可用",
+    empty: "",
   };
 
   return (
@@ -76,6 +104,12 @@ const SeatGrid: React.FC<SeatGridProps> = ({
             const seat = getSeatAt(r + 1, c + 1);
             const status = getSeatStatus(seat);
             const student = seat ? getStudentForSeat(seat.id) : null;
+            const isClickable =
+              seat &&
+              onSeatClick &&
+              status !== "empty" &&
+              status !== "disabled" &&
+              status !== "occupied-other";
 
             return (
               <div
@@ -83,22 +117,44 @@ const SeatGrid: React.FC<SeatGridProps> = ({
                 className={cn(
                   "relative w-12 h-12 rounded-lg border-2 flex items-center justify-center text-xs font-medium transition-all duration-200",
                   statusStyles[status],
-                  seat && onSeatClick && status !== "empty" && status !== "disabled"
+                  isClickable
                     ? "hover:scale-105 hover:shadow-md"
                     : ""
                 )}
-                onClick={() => seat && onSeatClick && status !== "empty" && status !== "disabled" && onSeatClick(seat)}
+                onClick={() => seat && isClickable && onSeatClick(seat)}
                 title={
                   seat
-                    ? `${seat.seatNo}${student ? ` - ${student.name} (${student.school})` : ""}`
+                    ? `${seat.seatNo}${
+                        status === "occupied-other"
+                          ? ` - ${statusLabels[status]}`
+                          : student
+                          ? ` - ${student.name} (${student.school})`
+                          : status !== "empty" && status !== "available"
+                          ? ` - ${statusLabels[status]}`
+                          : ""
+                      }`
                     : ""
                 }
               >
                 {seat && status !== "empty" && (
                   <>
-                    {status === "locked" && <Lock size={14} className="absolute top-0.5 right-0.5" />}
+                    {status === "locked" && (
+                      <Lock
+                        size={14}
+                        className="absolute top-0.5 right-0.5"
+                      />
+                    )}
                     {status === "occupied" && (
-                      <User size={14} className="absolute top-0.5 right-0.5 text-primary-600" />
+                      <User
+                        size={14}
+                        className="absolute top-0.5 right-0.5 text-primary-600"
+                      />
+                    )}
+                    {status === "occupied-other" && (
+                      <AlertTriangle
+                        size={14}
+                        className="absolute top-0.5 right-0.5 text-slate-400"
+                      />
                     )}
                     {status === "disabled" && <X size={14} />}
                     {showLabels && status !== "disabled" && (
@@ -123,6 +179,12 @@ const SeatGrid: React.FC<SeatGridProps> = ({
           <div className="w-4 h-4 rounded bg-primary-100 border-2 border-primary-300"></div>
           <span>已分配</span>
         </div>
+        {examId && (
+          <div className="flex items-center gap-2">
+            <div className="w-4 h-4 rounded bg-slate-200 border-2 border-slate-300"></div>
+            <span>其他场次占用</span>
+          </div>
+        )}
         <div className="flex items-center gap-2">
           <div className="w-4 h-4 rounded bg-warning-50 border-2 border-warning-300"></div>
           <span>已锁定</span>

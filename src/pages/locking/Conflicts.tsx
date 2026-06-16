@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useMemo } from "react";
 import { useExamStore } from "@/store/useExamStore";
 import {
   AlertTriangle,
@@ -11,6 +11,8 @@ import {
   XCircle,
   RefreshCw,
   ShieldCheck,
+  Repeat,
+  Calendar,
 } from "lucide-react";
 
 const Conflicts: React.FC = () => {
@@ -22,6 +24,7 @@ const Conflicts: React.FC = () => {
     assignments,
     resolveConflict,
     cancelAssignment,
+    getOverlappingExamIds,
     initData,
   } = useExamStore();
 
@@ -53,30 +56,69 @@ const Conflicts: React.FC = () => {
 
   const getStudent = (id: string) => students.find((s) => s.id === id);
   const getExam = (id: string) => exams.find((e) => e.id === id);
+  const getSeat = (id: string) => seats.find((s) => s.id === id);
 
-  const detectDuplicateAssignments = () => {
-    const seatMap = new Map<string, string[]>();
-    assignments
-      .filter((a) => a.status !== "cancelled")
-      .forEach((a) => {
-        const existing = seatMap.get(a.seatId) || [];
-        existing.push(a.studentId);
-        seatMap.set(a.seatId, existing);
-      });
+  const duplicateAssignments = useMemo(() => {
+    const nonCancelled = assignments.filter((a) => a.status !== "cancelled");
 
     const duplicates: Array<{
       seatId: string;
-      studentIds: string[];
+      groups: Array<{ examIds: string[]; assignmentIds: string[]; studentIds: string[] }>;
     }> = [];
-    seatMap.forEach((studentIds, seatId) => {
-      if (studentIds.length > 1) {
-        duplicates.push({ seatId, studentIds });
+
+    const seatMap = new Map<string, typeof nonCancelled>();
+    nonCancelled.forEach((a) => {
+      const list = seatMap.get(a.seatId) || [];
+      list.push(a);
+      seatMap.set(a.seatId, list);
+    });
+
+    seatMap.forEach((seatAssigns, seatId) => {
+      if (seatAssigns.length < 2) return;
+
+      const processed = new Set<number>();
+      const conflictGroups: Array<{ examIds: string[]; assignmentIds: string[]; studentIds: string[] }> = [];
+
+      for (let i = 0; i < seatAssigns.length; i++) {
+        if (processed.has(i)) continue;
+        const base = seatAssigns[i];
+        const overlappingIds = getOverlappingExamIds(base.examId);
+
+        const group: typeof conflictGroups[0] = {
+          examIds: [base.examId],
+          assignmentIds: [base.id],
+          studentIds: [base.studentId],
+        };
+        processed.add(i);
+
+        for (let j = i + 1; j < seatAssigns.length; j++) {
+          if (processed.has(j)) continue;
+          const other = seatAssigns[j];
+          if (overlappingIds.has(other.examId)) {
+            group.examIds.push(other.examId);
+            group.assignmentIds.push(other.id);
+            group.studentIds.push(other.studentId);
+            processed.add(j);
+          }
+        }
+
+        if (group.assignmentIds.length > 1) {
+          conflictGroups.push(group);
+        }
+      }
+
+      if (conflictGroups.length > 0) {
+        duplicates.push({ seatId, groups: conflictGroups });
       }
     });
-    return duplicates;
-  };
 
-  const duplicateAssignments = detectDuplicateAssignments();
+    return duplicates;
+  }, [assignments, getOverlappingExamIds]);
+
+  const totalDuplicateCount = duplicateAssignments.reduce(
+    (sum, d) => sum + d.groups.length,
+    0
+  );
 
   return (
     <div className="space-y-6 animate-fade-in">
@@ -84,17 +126,16 @@ const Conflicts: React.FC = () => {
         <div>
           <h1 className="text-2xl font-bold text-slate-800">冲突拦截</h1>
           <p className="text-slate-500 text-sm mt-1">
-            查看和处理分配过程中的冲突记录，防止重复撮合
+            按考试时间维度检测分配冲突，仅同一时间/时间重叠的考试才判定互斥
           </p>
         </div>
         <button
           onClick={() => {
-            if (confirm("检测是否存在重复分配？")) {
-              // 模拟检测
+            if (confirm("检测是否存在重复分配（按考试时间重叠维度）？")) {
               alert(
-                duplicateAssignments.length > 0
-                  ? `检测到 ${duplicateAssignments.length} 个重复分配！`
-                  : "未检测到重复分配，系统运行正常"
+                totalDuplicateCount > 0
+                  ? `检测到 ${totalDuplicateCount} 组时间重叠的重复分配！`
+                  : "未检测到时间维度冲突，系统运行正常"
               );
             }
           }}
@@ -103,6 +144,19 @@ const Conflicts: React.FC = () => {
           <RefreshCw size={18} />
           冲突检测
         </button>
+      </div>
+
+      <div className="bg-gradient-to-r from-accent-50 to-primary-50 rounded-2xl p-4 border border-primary-200/50 flex flex-wrap items-center gap-6 text-sm">
+        <div className="flex items-center gap-2">
+          <Repeat size={16} className="text-primary-600" />
+          <span className="text-slate-600">
+            判重规则: <span className="font-medium text-slate-800">仅时间重叠考试同座位才冲突</span>
+          </span>
+        </div>
+        <div className="flex items-center gap-2">
+          <CheckCircle2 size={16} className="text-emerald-600" />
+          <span className="text-slate-600">上午/下午非重叠场次 = 允许同一座位</span>
+        </div>
       </div>
 
       <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
@@ -141,55 +195,76 @@ const Conflicts: React.FC = () => {
         </div>
       </div>
 
-      {duplicateAssignments.length > 0 && (
+      {totalDuplicateCount > 0 && (
         <div className="bg-red-50 border border-red-200 rounded-2xl p-5">
           <div className="flex items-start gap-3">
             <XCircle size={22} className="text-red-600 flex-shrink-0 mt-0.5" />
             <div className="flex-1">
               <h3 className="font-semibold text-red-800">
-                检测到 {duplicateAssignments.length} 个重复分配！
+                检测到 {totalDuplicateCount} 组时间重叠的重复分配！
               </h3>
               <p className="text-sm text-red-700 mt-1">
-                以下考位被分配给多名考生，请及时处理：
+                以下考位在<b>时间重叠考试</b>中被分给多名考生，请及时处理：
               </p>
-              <div className="mt-3 space-y-2">
-                {duplicateAssignments.map((dup) => {
-                  const seat = seats.find((s) => s.id === dup.seatId);
-                  return (
-                    <div
-                      key={dup.seatId}
-                      className="flex items-center justify-between p-3 bg-white rounded-lg border border-red-200"
-                    >
-                      <div>
-                        <p className="font-medium text-slate-800">
-                          {seat?.seatNo || "未知考位"}
-                        </p>
-                        <p className="text-xs text-slate-500 mt-0.5">
-                          涉及考生:{" "}
-                          {dup.studentIds
-                            .map((sid) => getStudent(sid)?.name)
-                            .join(", ")}
-                        </p>
-                      </div>
-                      <button
-                        onClick={() => {
-                          if (confirm("取消此考位的所有分配？")) {
-                            assignments
-                              .filter(
-                                (a) =>
-                                  a.seatId === dup.seatId &&
-                                  a.status !== "cancelled"
-                              )
-                              .forEach((a) => cancelAssignment(a.id));
-                          }
-                        }}
-                        className="px-3 py-1.5 bg-red-500 text-white text-xs font-medium rounded-lg hover:bg-red-600 transition-colors"
+              <div className="mt-3 space-y-3">
+                {duplicateAssignments.map((dup) =>
+                  dup.groups.map((group, gi) => {
+                    const seat = getSeat(dup.seatId);
+                    return (
+                      <div
+                        key={`${dup.seatId}-${gi}`}
+                        className="flex items-center justify-between p-4 bg-white rounded-xl border border-red-200"
                       >
-                        全部取消
-                      </button>
-                    </div>
-                  );
-                })}
+                        <div className="flex-1 min-w-0">
+                          <div className="flex items-center gap-2 flex-wrap mb-2">
+                            <p className="font-bold text-slate-800">
+                              {seat?.seatNo || "未知考位"}
+                            </p>
+                            <span className="px-2 py-0.5 bg-red-100 text-red-700 rounded-full text-xs font-medium">
+                              {group.examIds.length} 场考试时间重叠
+                            </span>
+                          </div>
+                          <div className="flex flex-wrap gap-1.5 mb-2">
+                            {group.examIds.map((eid) => {
+                              const exam = getExam(eid);
+                              return (
+                                <span
+                                  key={eid}
+                                  className="inline-flex items-center gap-1 px-2 py-0.5 bg-warning-50 text-warning-700 rounded text-xs"
+                                >
+                                  <Calendar size={10} />
+                                  {exam?.name || "未知"}
+                                </span>
+                              );
+                            })}
+                          </div>
+                          <p className="text-xs text-slate-500">
+                            涉及考生:{" "}
+                            {group.studentIds
+                              .map((sid) => getStudent(sid)?.name || "未知")
+                              .join(", ")}
+                          </p>
+                        </div>
+                        <button
+                          onClick={() => {
+                            if (
+                              confirm(
+                                "确定取消该冲突组所有分配吗？将释放此考位在这些考试中的占用。"
+                              )
+                            ) {
+                              group.assignmentIds.forEach((aid) =>
+                                cancelAssignment(aid)
+                              );
+                            }
+                          }}
+                          className="ml-4 px-3 py-1.5 bg-red-500 text-white text-xs font-medium rounded-lg hover:bg-red-600 transition-colors flex-shrink-0"
+                        >
+                          全部取消
+                        </button>
+                      </div>
+                    );
+                  })
+                )}
               </div>
             </div>
           </div>
@@ -234,7 +309,7 @@ const Conflicts: React.FC = () => {
               暂无冲突记录
             </h3>
             <p className="text-sm text-slate-500 mt-1">
-              系统分配运行正常，所有考位互斥锁定生效
+              按考试时间重叠维度检测，系统分配正常，未发现互斥冲突
             </p>
           </div>
         ) : (
@@ -338,19 +413,19 @@ const Conflicts: React.FC = () => {
           <div className="p-4 bg-white/80 rounded-xl backdrop-blur-sm">
             <p className="font-medium text-slate-800 text-sm">分配前校验</p>
             <p className="text-xs text-slate-500 mt-1">
-              分配前检查考位锁定状态和考生分配记录
+              校验该时间重叠考试集合内考位是否已被占用
             </p>
           </div>
           <div className="p-4 bg-white/80 rounded-xl backdrop-blur-sm">
-            <p className="font-medium text-slate-800 text-sm">实时锁定</p>
+            <p className="font-medium text-slate-800 text-sm">实时锁定(时间维度)</p>
             <p className="text-xs text-slate-500 mt-1">
-              分配成功立即锁定，防止并发重复分配
+              按考试时间维度锁定考位，非重叠时段允许考位复用
             </p>
           </div>
           <div className="p-4 bg-white/80 rounded-xl backdrop-blur-sm">
             <p className="font-medium text-slate-800 text-sm">定期巡检</p>
             <p className="text-xs text-slate-500 mt-1">
-              系统定时检测重复分配，确保数据一致性
+              按时间重叠维度检测重复分配，确保数据一致性
             </p>
           </div>
         </div>

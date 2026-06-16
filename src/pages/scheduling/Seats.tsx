@@ -83,7 +83,18 @@ const Seats: React.FC = () => {
     <div className="space-y-6 animate-fade-in">
       <div>
         <h1 className="text-2xl font-bold text-slate-800">考位建档</h1>
-        <p className="text-slate-500 text-sm mt-1">查看和管理所有考位状态</p>
+        <p className="text-slate-500 text-sm mt-1">考位资源建档管理（全局状态），按考试时间维度查看分配请前往「锁定矩阵」</p>
+      </div>
+
+      <div className="bg-gradient-to-r from-accent-50 to-primary-50 rounded-2xl p-4 border border-primary-200/50 flex flex-wrap items-center gap-4 text-xs">
+        <div className="text-slate-600">
+          <span className="font-medium text-slate-800">说明：</span>
+          「已占用」为任意场次有分配的考位，实际互斥以「时间重叠」为粒度。
+        </div>
+        <div className="flex items-center gap-1.5 text-emerald-700">
+          <span className="w-2 h-2 rounded-full bg-emerald-500"></span>
+          上午/下午非重叠考试可复用同一座位
+        </div>
       </div>
 
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
